@@ -6,9 +6,11 @@
 #include <vector>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 
 #include "order.h"
 #include "orderbook.h"
+#include "exchange.h"
 #include "spsc_queue.h"
 #include "mutex_queue.h"
 #include "latency_tracker.h"
@@ -21,12 +23,23 @@ inline int64_t now_ns() {
 }
 
 // ============================================================================
-// makeCommand: Generate a deterministic synthetic order.
+// Symbols used for multi-book benchmarking
+// ============================================================================
+static const char* BENCH_SYMBOLS[] = {"AAPL", "TSLA", "INFY", "GOOG", "MSFT"};
+static const int NUM_SYMBOLS = 5;
+
+// ============================================================================
+// makeCommand: Generate a deterministic synthetic order with symbol rotation.
 // ============================================================================
 Command makeCommand(uint64_t id) {
     Command cmd{};
     cmd.type    = NEW;
     cmd.orderId = id;
+
+    // Rotate symbols deterministically
+    const char* sym = BENCH_SYMBOLS[id % NUM_SYMBOLS];
+    std::strncpy(cmd.symbol, sym, sizeof(cmd.symbol) - 1);
+    cmd.symbol[sizeof(cmd.symbol) - 1] = '\0';
 
     if (id % 100 == 0 && id > 0) {
         if (id % 200 == 0) {
@@ -61,7 +74,7 @@ void runBenchmark(const std::string& queueName, int numOrders,
     }
 
     QueueType queue;
-    OrderBook book;
+    Exchange exchange;
     std::atomic<bool> done{false};
     tracker.reset();
 
@@ -76,10 +89,11 @@ void runBenchmark(const std::string& queueName, int numOrders,
                 cmd.ts_process_start = now_ns();
 
                 Order o{cmd.orderId, cmd.side, cmd.price, cmd.quantity, cmd.timestamp};
+                std::string symbol(cmd.symbol);
 
                 std::cout.rdbuf(nullptr);
-                book.addOrder(o);
-                book.matchOrders();
+                exchange.addOrder(symbol, o);
+                exchange.matchOrders(symbol);
                 std::cout.rdbuf(origBuf);
 
                 cmd.ts_match_complete = now_ns();
@@ -193,7 +207,7 @@ int main() {
         // SPSC benchmark
         {
             SPSCQueue<Command, 1024> queue;
-            OrderBook book;
+            Exchange exchange;
             spscTracker.reset();
 
             std::thread consumer([&]() {
@@ -204,10 +218,11 @@ int main() {
                         cmd.ts_queue_pop = now_ns();
                         cmd.ts_process_start = now_ns();
                         Order o{cmd.orderId, cmd.side, cmd.price, cmd.quantity, 0};
+                        std::string symbol(cmd.symbol);
                         
                         std::cout.rdbuf(nullptr);
-                        book.addOrder(o);
-                        book.matchOrders();
+                        exchange.addOrder(symbol, o);
+                        exchange.matchOrders(symbol);
                         std::cout.rdbuf(origBuf);
                         
                         cmd.ts_match_complete = now_ns();
@@ -235,7 +250,7 @@ int main() {
         // Mutex benchmark
         {
             MutexQueue<Command> queue;
-            OrderBook book;
+            Exchange exchange;
             mutexTracker.reset();
 
             for (int i = 0; i < compOrders; i++) {
@@ -251,10 +266,11 @@ int main() {
                         cmd.ts_queue_pop = now_ns();
                         cmd.ts_process_start = now_ns();
                         Order o{cmd.orderId, cmd.side, cmd.price, cmd.quantity, 0};
+                        std::string symbol(cmd.symbol);
                         
                         std::cout.rdbuf(nullptr);
-                        book.addOrder(o);
-                        book.matchOrders();
+                        exchange.addOrder(symbol, o);
+                        exchange.matchOrders(symbol);
                         std::cout.rdbuf(origBuf);
                         
                         cmd.ts_match_complete = now_ns();
@@ -324,7 +340,7 @@ int main() {
     {
         int profOrders = 100000;
         SPSCQueue<Command, 1024> queue;
-        OrderBook book;
+        Exchange exchange;
         LatencyTracker profTracker;
         profTracker.reset();
         std::streambuf* origBuf = std::cout.rdbuf();
@@ -342,10 +358,11 @@ int main() {
                     cmd.ts_queue_pop = now_ns();
                     cmd.ts_process_start = now_ns();
                     Order o{cmd.orderId, cmd.side, cmd.price, cmd.quantity, 0};
+                    std::string symbol(cmd.symbol);
                     
                     std::cout.rdbuf(nullptr);
-                    book.addOrder(o);
-                    book.matchOrders();
+                    exchange.addOrder(symbol, o);
+                    exchange.matchOrders(symbol);
                     std::cout.rdbuf(origBuf);
                     
                     cmd.ts_match_complete = now_ns();

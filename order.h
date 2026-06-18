@@ -34,7 +34,8 @@ enum CommandType {
     NEW,
     CANCEL,
     MODIFY,
-    STATS
+    STATS,
+    BOOK       // Display order book for a specific symbol
 };
 
 // ============================================================================
@@ -78,6 +79,7 @@ struct Command {
     double      price;      // NEW and MODIFY
     int         quantity;   // NEW and MODIFY
     long long   timestamp;  // Set by network thread for all types
+    char        symbol[16]; // Symbol identifier (e.g., "AAPL", "TSLA")
 
     // ========================================================================
     // Latency measurement timestamps (steady_clock nanoseconds)

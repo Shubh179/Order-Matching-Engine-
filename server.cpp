@@ -15,6 +15,7 @@
 #include <csignal>
 #include <netinet/tcp.h>
 #include "orderbook.h"
+#include "exchange.h"
 #include "order.h"
 #include "spsc_queue.h"
 #include "latency_tracker.h"
@@ -34,7 +35,7 @@
 //   - No mutexes anywhere around the OrderBook or LatencyTracker
 // ============================================================================
 SPSCQueue<Command, 1024> spscQueue;
-OrderBook orderBook;
+Exchange exchange;
 std::atomic<bool> running{true};
 
 // ============================================================================
@@ -99,8 +100,9 @@ void matchingEngineThread() {
             cmd.ts_queue_pop = now_ns();
 
             if (cmd.type == STATS) {
-                // STATS command: print the latency report
+                // STATS command: print the latency report + exchange stats
                 tracker.printStats();
+                exchange.printStats();
                 continue;
             }
 
@@ -116,19 +118,27 @@ void matchingEngineThread() {
                     o.quantity  = cmd.quantity;
                     o.timestamp = cmd.timestamp;
 
-                    orderBook.addOrder(o);
-                    orderBook.matchOrders();
+                    std::string symbol(cmd.symbol);
+                    exchange.addOrder(symbol, o);
+                    exchange.matchOrders(symbol);
                     break;
                 }
                 case CANCEL: {
-                    orderBook.cancelOrder(cmd.orderId);
+                    exchange.cancelOrder(cmd.orderId);
                     break;
                 }
                 case MODIFY: {
-                    orderBook.modifyOrder(cmd.orderId, cmd.quantity,
-                                         cmd.price, cmd.timestamp);
-                    orderBook.matchOrders();
+                    std::string symbol(cmd.symbol);
+                    exchange.modifyOrder(cmd.orderId, symbol,
+                                        cmd.quantity, cmd.price,
+                                        cmd.timestamp);
+                    exchange.matchOrders(symbol);
                     break;
+                }
+                case BOOK: {
+                    std::string symbol(cmd.symbol);
+                    exchange.printBook(symbol);
+                    continue;  // No latency tracking for BOOK
                 }
                 default:
                     break;
@@ -140,8 +150,6 @@ void matchingEngineThread() {
             // Record latency and print per-order breakdown
             tracker.record(cmd);
             tracker.printOrderLatency(cmd);
-
-            orderBook.printBook();
         } else {
             std::this_thread::yield();
         }
@@ -158,10 +166,11 @@ void matchingEngineThread() {
 //   - ts_queue_push:    just before SPSC push
 //
 // Supported formats:
-//   BUY <qty> <price>
-//   SELL <qty> <price>
+//   BUY <symbol> <qty> <price>
+//   SELL <symbol> <qty> <price>
 //   CANCEL <orderId>
-//   MODIFY <orderId> <qty> <price>
+//   MODIFY <orderId> <symbol> <qty> <price>
+//   BOOK <symbol>
 //   STATS
 // ============================================================================
 void processLine(const std::string& line, uint64_t& nextOrderId,
@@ -173,27 +182,30 @@ void processLine(const std::string& line, uint64_t& nextOrderId,
     ss >> cmdStr;
 
     if (cmdStr == "BUY" || cmdStr == "SELL") {
+        std::string symbol;
         int quantity;
         double price;
 
-        if (!(ss >> quantity >> price)) {
+        if (!(ss >> symbol >> quantity >> price)) {
             std::cout << "[Thread 1] Malformed order: " << line << "\n";
             return;
         }
 
-        Command cmd;
+        Command cmd{};
         cmd.type      = NEW;
         cmd.orderId   = nextOrderId++;
         cmd.side      = (cmdStr == "BUY") ? BUY : SELL;
         cmd.price     = price;
         cmd.quantity  = quantity;
         cmd.timestamp = getCurrentTimestamp();
+        std::strncpy(cmd.symbol, symbol.c_str(), sizeof(cmd.symbol) - 1);
+        cmd.symbol[sizeof(cmd.symbol) - 1] = '\0';
 
         // Timestamp 1: Network Receive (passed from recv site)
         cmd.ts_network_recv = recvTimestamp;
 
         std::cout << "[Thread 1] Pushing NEW Order ID=" << cmd.orderId
-                  << " to queue...\n";
+                  << " " << symbol << " to queue...\n";
 
         // Timestamp 2: Queue Push
         cmd.ts_queue_push = now_ns();
@@ -209,11 +221,12 @@ void processLine(const std::string& line, uint64_t& nextOrderId,
             return;
         }
 
-        Command cmd;
+        Command cmd{};
         cmd.type      = CANCEL;
         cmd.orderId   = orderId;
         cmd.timestamp = getCurrentTimestamp();
         cmd.ts_network_recv = recvTimestamp;
+        cmd.symbol[0] = '\0';  // CANCEL doesn't need symbol
 
         std::cout << "[Thread 1] Pushing CANCEL Order ID=" << cmd.orderId
                   << " to queue...\n";
@@ -225,33 +238,56 @@ void processLine(const std::string& line, uint64_t& nextOrderId,
 
     } else if (cmdStr == "MODIFY") {
         uint64_t orderId;
+        std::string symbol;
         int quantity;
         double price;
 
-        if (!(ss >> orderId >> quantity >> price)) {
+        if (!(ss >> orderId >> symbol >> quantity >> price)) {
             std::cout << "[Thread 1] Malformed MODIFY: " << line << "\n";
             return;
         }
 
-        Command cmd;
+        Command cmd{};
         cmd.type      = MODIFY;
         cmd.orderId   = orderId;
         cmd.quantity  = quantity;
         cmd.price     = price;
         cmd.timestamp = getCurrentTimestamp();
         cmd.ts_network_recv = recvTimestamp;
+        std::strncpy(cmd.symbol, symbol.c_str(), sizeof(cmd.symbol) - 1);
+        cmd.symbol[sizeof(cmd.symbol) - 1] = '\0';
 
         std::cout << "[Thread 1] Pushing MODIFY Order ID=" << cmd.orderId
-                  << " to queue...\n";
+                  << " " << symbol << " to queue...\n";
 
         cmd.ts_queue_push = now_ns();
         while (!spscQueue.push(cmd)) {
             std::this_thread::yield();
         }
 
+    } else if (cmdStr == "BOOK") {
+        std::string symbol;
+
+        if (!(ss >> symbol)) {
+            std::cout << "[Thread 1] Malformed BOOK: " << line << "\n";
+            return;
+        }
+
+        Command cmd{};
+        cmd.type = BOOK;
+        cmd.ts_network_recv = recvTimestamp;
+        cmd.ts_queue_push = now_ns();
+        std::strncpy(cmd.symbol, symbol.c_str(), sizeof(cmd.symbol) - 1);
+        cmd.symbol[sizeof(cmd.symbol) - 1] = '\0';
+
+        std::cout << "[Thread 1] Pushing BOOK " << symbol << " to queue...\n";
+        while (!spscQueue.push(cmd)) {
+            std::this_thread::yield();
+        }
+
     } else if (cmdStr == "STATS") {
         // STATS command: push through queue so matching thread prints report
-        Command cmd;
+        Command cmd{};
         cmd.type = STATS;
         cmd.ts_network_recv = recvTimestamp;
         cmd.ts_queue_push = now_ns();

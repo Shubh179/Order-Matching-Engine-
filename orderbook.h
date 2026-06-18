@@ -3,10 +3,22 @@
 
 #include <map>
 #include <list>
+#include <string>
 #include <iostream>
 #include <functional>
 #include <unordered_map>
 #include "order.h"
+
+// ============================================================================
+// SymbolStats: Per-symbol statistics tracking.
+//   Tracks total orders submitted, trades executed, and volume traded.
+//   Lives inside each OrderBook instance — single-threaded, no sync.
+// ============================================================================
+struct SymbolStats {
+    uint64_t totalOrders = 0;   // Total orders submitted to this book
+    uint64_t totalTrades = 0;   // Total trades executed in this book
+    uint64_t totalVolume = 0;   // Total quantity traded in this book
+};
 
 // ============================================================================
 // OrderLocation: Stores everything needed to locate an order in O(1).
@@ -70,6 +82,9 @@ private:
     // O(1) order lookup index
     std::unordered_map<uint64_t, OrderLocation> orderMap;
 
+    // Per-symbol statistics
+    SymbolStats stats;
+
     // ========================================================================
     // Internal: remove an order given its OrderLocation. O(1).
     // Cleans up empty price levels from the map.
@@ -121,6 +136,7 @@ public:
     // ========================================================================
     void addOrder(const Order& o) {
         insertOrder(o);
+        stats.totalOrders++;
         std::cout << "[NEW] Order ID=" << o.orderId
                   << " " << (o.side == BUY ? "BUY" : "SELL")
                   << " " << o.quantity << "@" << o.price << "\n";
@@ -258,6 +274,9 @@ public:
                       << " (buyer=" << firstBid.orderId
                       << ", seller=" << firstAsk.orderId << ")\n";
 
+            stats.totalTrades++;
+            stats.totalVolume += tradeQty;
+
             firstBid.quantity -= tradeQty;
             firstAsk.quantity -= tradeQty;
 
@@ -284,8 +303,11 @@ public:
     // ========================================================================
     // printBook: Display top 5 price levels for each side.
     // ========================================================================
-    void printBook() const {
-        std::cout << "=== Bids (Top 5) ===\n";
+    void printBook(const std::string& symbol = "") const {
+        if (!symbol.empty()) {
+            std::cout << "\n=== " << symbol << " Order Book ===\n";
+        }
+        std::cout << "Bids (Top 5):\n";
         int count = 0;
         for (const auto& [price, queue] : bids) {
             if (count >= 5) break;
@@ -302,7 +324,7 @@ public:
             std::cout << "Empty\n";
         }
 
-        std::cout << "=== Asks (Top 5) ===\n";
+        std::cout << "Asks (Top 5):\n";
         count = 0;
         for (const auto& [price, queue] : asks) {
             if (count >= 5) break;
@@ -319,6 +341,11 @@ public:
             std::cout << "Empty\n";
         }
     }
+
+    // ========================================================================
+    // getStats: Accessor for per-symbol statistics.
+    // ========================================================================
+    const SymbolStats& getStats() const { return stats; }
 };
 
 #endif // ORDERBOOK_H
